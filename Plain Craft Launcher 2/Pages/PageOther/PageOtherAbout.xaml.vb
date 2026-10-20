@@ -22,7 +22,7 @@ Public Class PageOtherAbout
         ClipboardSet(Identify)
     End Sub
     Private Sub BtnDonateCodeInput_Click() Handles BtnDonateInput.Click
-        InputPotatoCode(False)
+        InputPotatoCode()
     End Sub
     Private Sub BtnDonateOutput_Click(sender As Object, e As EventArgs) Handles BtnDonateOutput.Click
         GeneratePotatoCode()

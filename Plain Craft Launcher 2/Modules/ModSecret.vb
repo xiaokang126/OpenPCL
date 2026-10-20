@@ -324,256 +324,6 @@ Friend Module ModSecret
 
 #End Region
 
-#Region "更新"
-
-    Private IsUpdating As Boolean = False
-    Private IsSilentUpdate As Boolean = False
-    Private IsUiCheckingUpdate As Boolean = False
-    Private UpdateMark As String = "EmptyMark********************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************"
-
-    Friend Sub UpdateCheckByButton()
-        If IsUiCheckingUpdate Then
-            Hint("正在检查更新，请稍候！")
-            Return
-        End If
-        IsUiCheckingUpdate = True
-        RunInThread(
-        Sub()
-            Try
-                Hint("正在检查更新，请稍候！")
-                ServerLoader.WaitForExit(IsForceRestart:=True)
-                Dim IsNewest = PageSetupSystem.IsLauncherNewest()
-                If Not IsNewest.HasValue Then
-                    Hint("连接 PCL 服务器失败，请确认系统时间是否准确，尝试将 PCL 加入杀毒软件或防火墙白名单，然后重启 PCL！", HintType.Red)
-                ElseIf IsNewest.Value Then
-                    Hint($"已经是最新{BuildTypeDisplay} {VersionBaseName}，不需要更新啦，可以直接使用！", HintType.Green)
-                Else
-                    If Not HasUpdatePermission Then
-                        InputPotatoCode(IsUpdating:=True)
-                        If Not HasUpdatePermission Then Return
-                    ElseIf MyMsgBox("发现启动器更新，是否立即下载？", "发现更新！", "更新！冲！", "取消") = 2 Then
-                        Return
-                    End If
-                    UpdateStart(Silent:=False)
-                End If
-            Catch ex As Exception
-                Logger.Error(ex, "尝试手动开始更新失败", LogBehavior.AlertThenFeedback)
-            Finally
-                IsUiCheckingUpdate = False
-            End Try
-        End Sub)
-    End Sub
-
-    Private Sub UpdateStart(Silent As Boolean, Optional UrlsOverride As IEnumerable(Of String) = Nothing)
-        If IsUpdating Then
-            If Not Silent Then
-                Hint("PCL 正在下载更新，更新结束时将自动重启，请稍候！")
-                IsSilentUpdate = False
-            End If
-            If IsUpdateWaitingRestart Then UpdateRestart(TriggerRestartAndByEnd:=True)
-            Return
-        End If
-        IsUpdating = True
-        IsSilentUpdate = Silent
-        If Not IsSilentUpdate Then Hint("PCL 正在下载更新，更新结束时将自动重启，请稍候！")
-        Try
-            Dim Urls As List(Of String) = Nothing
-            Dim Extension As String = Nothing
-            Dim LocalPath As String = Nothing
-            Dim Loader As LoaderCombo(Of String) = Nothing
-            Loader = New LoaderCombo(Of String)("启动器更新", New LoaderBase() {
-                New LoaderTask(Of String, List(Of NetFile))("获取更新信息",
-                Sub(Task)
-                    If ServerLoader.State = LoadState.Loading Then ServerLoader.WaitForExit()
-                    If UrlsOverride IsNot Nothing Then
-                        Urls = UrlsOverride.ToList()
-                    ElseIf ServerConfig IsNot Nothing AndAlso ServerConfig("Update") IsNot Nothing AndAlso ServerConfig("Update")(BuildTypes.Release.ToString) IsNot Nothing Then
-                        Dim UpdateInfo = CType(ServerConfig("Update")(BuildTypes.Release.ToString), JObject)
-                        If UpdateInfo.ContainsKey("PatchUrls") AndAlso UpdateMark.StartsWithF("Empty") Then
-                            Urls = UpdateInfo("PatchUrls").ToObject(Of List(Of String))()
-                        ElseIf UpdateInfo.ContainsKey("DownloadUrls") Then
-                            Urls = UpdateInfo("DownloadUrls").ToObject(Of List(Of String))()
-                        End If
-                    End If
-                    If Urls Is Nothing OrElse Not Urls.Any Then
-                        IsUpdating = False
-                        Throw New Exception("更新失败：服务器没有提供有效的更新包下载链接，或无法连接到服务器！")
-                    End If
-                    Urls = Urls.Select(Function(u) ArgumentReplace(u, AddressOf WebUtility.HtmlEncode)).ToList()
-                    Extension = "." & Urls.First.BeforeLast("{CDN}").AfterLast(".")
-                    LocalPath = $"{RequestTaskTempFolder()}{VersionBaseName}.{CInt(BuildType)}{Extension}"
-                    Logger.Info($"更新开始，静默：{IsSilentUpdate}，扩展名：{Extension}，下载目标：{LocalPath}，URL：{Urls.Join("，")}")
-                    Task.Output = New List(Of NetFile) From {New NetFile(Urls, LocalPath)}
-                End Sub) With {.ProgressWeight = 0.1},
-                New LoaderDownload("下载更新文件", New List(Of NetFile)) With {.ProgressWeight = 1},
-                New LoaderTask(Of String, Integer)("安装更新",
-                Sub(Task)
-                    Dim TargetPath = Paths.Base & "PCL\Plain Craft Launcher 2.exe"
-                    If FileUtils.Exists(TargetPath) Then
-                        FileUtils.Delete(TargetPath)
-                        Logger.Info($"已清理已存在的更新文件：{TargetPath}")
-                    End If
-                    If Extension = ".zip" Then
-                        Logger.Info($"解压更新文件：{LocalPath}")
-                        FileUtils.ExtractToDirectory(LocalPath, Paths.Base & "PCL\")
-                    Else
-                        Logger.Info($"应用补丁文件：{PathExe} + {LocalPath} → {TargetPath}")
-                        MsDelta.Apply(PathExe, LocalPath, TargetPath)
-                    End If
-                    If IsSilentUpdate Then
-                        IsUpdateWaitingRestart = True
-                        Return
-                    End If
-                    If McLaunchLoader.State = LoadState.Loading Then
-                        Hint("更新已准备就绪，PCL 将在游戏启动完成后重启！", HintType.Green)
-                        Do While McLaunchLoader.State = LoadState.Loading
-                            Thread.Sleep(10)
-                        Loop
-                    End If
-                    UpdateRestart(TriggerRestartAndByEnd:=True)
-                End Sub) With {.ProgressWeight = 0.1}
-            })
-            Loader.OnStateChanged =
-            Sub(_Loader)
-                If Loader.State = LoadState.Failed Then
-                    If IsSilentUpdate Then
-                        Logger.Warn(Loader.Error, "启动器静默更新失败", LogBehavior.ToastIfDebug)
-                    ElseIf Loader.Error.GetDisplay(False).Contains("(403)") Then
-                        MyMsgBox("你的系统时间可能并不准确，导致下载验证未通过。" & vbCrLf & "请在校对、修改系统时间后再次尝试更新。", "启动器更新失败")
-                    ElseIf Loader.Error.GetDisplay(False).Contains("(404)") Then
-                        MyMsgBox("未找到更新包。可能的原因有：" & vbCrLf & "- 你所使用的 PCL 不是官方版本" & vbCrLf & "- 服务器异常", "启动器更新失败")
-                    ElseIf TypeOf Loader.Error Is FileNotFoundException Then
-                        If MyMsgBox("由于被 Windows 安全中心拦截，或者存在权限问题，导致 PCL 无法更新。" & vbCrLf & "请将 PCL 所在文件夹加入白名单！", "更新失败", "查看帮助", "确定", "", IsWarn:=True) = 1 Then
-                            CustomEvent.Raise(CustomEvent.EventType.打开帮助, "启动器/Microsoft Defender 添加排除项.json")
-                        End If
-                    Else
-                        Logger.Error(Loader.Error, "启动器更新失败", LogBehavior.AlertThenFeedback)
-                    End If
-                End If
-                If Loader.State = LoadState.Finished OrElse Loader.State = LoadState.Failed OrElse Loader.State = LoadState.Canceled Then IsUpdating = False
-            End Sub
-            Loader.Start()
-            RunInUi(
-            Sub()
-                If Not IsSilentUpdate Then
-                    LoaderTaskbarAdd(Loader)
-                    FrmMain.BtnExtraDownload.ShowRefresh()
-                End If
-            End Sub)
-        Catch ex As Exception
-            Logger.Error(ex, "开始启动器更新失败", LogBehavior.AlertThenFeedback)
-            IsUpdating = False
-        End Try
-    End Sub
-
-    Friend IsUpdateWaitingRestart As Boolean = False
-    Public Sub UpdateRestart(TriggerRestartAndByEnd As Boolean)
-        Try
-            IsUpdateWaitingRestart = False
-            Dim UpdateFile = Paths.Base & "PCL\Plain Craft Launcher 2.exe"
-            Dim Arguments = $"--update {Process.GetCurrentProcess().Id} ""{AppDomain.CurrentDomain.SetupInformation.ApplicationName}"" ""{AppDomain.CurrentDomain.SetupInformation.ApplicationName}"" {TriggerRestartAndByEnd}"
-            Logger.Info($"更新程序启动，参数：{Arguments}")
-            StartProcess(New ProcessStartInfo(UpdateFile) With {
-                .WindowStyle = ProcessWindowStyle.Hidden,
-                .CreateNoWindow = True,
-                .Arguments = Arguments
-            })
-            If TriggerRestartAndByEnd Then
-                FrmMain.EndProgram(SendWarning:=False)
-                Logger.Info("已由于更新强制结束程序")
-            End If
-        Catch ex As System.ComponentModel.Win32Exception
-            Logger.Warn(ex, "自动更新时触发 Win32 错误，疑似被拦截", LogBehavior.ToastIfDebug)
-            If MyMsgBox("由于被 Windows 安全中心拦截，或者存在权限问题，导致 PCL 无法更新。" & vbCrLf &
-                        $"请将 PCL 所在文件夹加入白名单，或者手动用 {Paths.Base}PCL\Plain Craft Launcher 2.exe 替换当前文件！",
-                        "更新失败", "查看帮助", "确定", "", IsWarn:=True) = 1 Then
-                CustomEvent.Raise(CustomEvent.EventType.打开帮助, "启动器/Microsoft Defender 添加排除项.json")
-            End If
-        End Try
-    End Sub
-    Public Sub UpdateReplace(ProcessId As Integer, OldFileName As String, NewFileName As String, TriggerRestart As Boolean)
-        Try
-            Process.GetProcessById(ProcessId).Kill()
-        Catch
-        End Try
-        Dim OldFilePath = Paths.Base.Substring(0, Paths.Base.Length - 4) & PathUtils.GetLastPart(OldFileName)
-        Dim NewFilePath = Paths.Base.Substring(0, Paths.Base.Length - 4) & PathUtils.GetLastPart(NewFileName)
-        Dim FormatFailure As Func(Of String, String) =
-        Function(Reason)
-            Return $"由于{Reason}，PCL 无法完成更新。{vbCrLf}请依次尝试：{vbCrLf}" &
-                   If(Paths.Base.StartsWithF(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), True) OrElse
-                      Paths.Base.StartsWithF(Environment.GetFolderPath(Environment.SpecialFolder.Personal), True),
-                      " - 将 PCL 文件移动到桌面、文档、C 盘以外的文件夹（这或许可以一劳永逸地解决权限问题）" & vbCrLf, "") &
-                   If(Paths.Base.StartsWithF("C", True),
-                      " - 将 PCL 文件移动到 C 盘以外的文件夹（这或许可以一劳永逸地解决权限问题）" & vbCrLf, "") &
-                   If(Not WindowsUtils.HasAdminRole(), " - 右键 PCL，选择以管理员身份运行" & vbCrLf, "") &
-                   $" - 手动剪切 PCL 文件夹中的新版本程序，覆盖原程序：{vbCrLf}   将位于 {PathExe}{vbCrLf}   的程序{vbCrLf}   剪切到 {NewFilePath} 并覆盖即可。"
-        End Function
-
-        Dim DeleteException As Exception = Nothing
-        For Retry = 0 To 4
-            Try
-                FileUtils.Delete(OldFilePath)
-                FileUtils.Delete(NewFilePath)
-                If Not FileUtils.Exists(OldFilePath) AndAlso Not FileUtils.Exists(NewFilePath) Then Exit For
-            Catch ex As Exception
-                DeleteException = ex
-            End Try
-            Thread.Sleep(Retry * 500 + 500)
-        Next
-
-        If FileUtils.Exists(OldFilePath) OrElse FileUtils.Exists(NewFilePath) Then
-            If TypeOf DeleteException Is UnauthorizedAccessException Then
-                MsgBox(FormatFailure("删除老版本文件时权限不足") & vbCrLf & vbCrLf & "详细错误信息：" & vbCrLf & DeleteException.GetDisplay(True), MsgBoxStyle.Critical, "更新失败")
-            Else
-                MsgBox(FormatFailure("删除老版本文件时出错") & vbCrLf & vbCrLf & "详细错误信息：" & vbCrLf & If(DeleteException, New Exception("未知错误")).GetDisplay(True), MsgBoxStyle.Critical, "更新失败")
-            End If
-            Return
-        End If
-
-        Try
-            FileUtils.Copy(PathExe, NewFilePath)
-        Catch ex As UnauthorizedAccessException
-            MsgBox(FormatFailure("复制新版本文件时权限不足") & vbCrLf & vbCrLf & "详细错误信息：" & vbCrLf & ex.GetDisplay(True), MsgBoxStyle.Critical, "更新失败")
-            Return
-        Catch ex As Exception
-            MsgBox(FormatFailure("复制新版本文件时出错") & vbCrLf & vbCrLf & "详细错误信息：" & vbCrLf & ex.GetDisplay(True), MsgBoxStyle.Critical, "更新失败")
-            Return
-        End Try
-
-        If Not TriggerRestart Then Return
-        Try
-            StartProcess(NewFilePath)
-        Catch ex As Exception
-            MsgBox("PCL 更新已完成，但在自动重启 PCL 时遇到了意外，请手动启动 PCL。" & vbCrLf & vbCrLf &
-                   "详细错误信息：" & vbCrLf & ex.GetDisplay(True), MsgBoxStyle.Information, "更新完成")
-        End Try
-    End Sub
-
-    ''' <summary>
-    ''' 确保 PathTemp/Latest.exe 是最新正式版的 PCL，它会被用于整合包打包。
-    ''' 如果不是，则下载一个。
-    ''' </summary>
-    Friend Sub DownloadLatestPCL(Optional LoaderToSyncProgress As LoaderBase = Nothing)
-        Dim LocalVersion = If(FileUtils.Exists(PathTemp & "Latest.exe"), Settings.Get(Of Integer)("SystemHighestSavedBetaVersionReg"), 0)
-        Dim ServerVersion = 0
-        Dim Notice = If(FileUtils.TryReadAsString(PathTemp & "Cache\Notice.cfg"), "")
-        If Notice.Split("|"c).Count >= 3 Then ServerVersion = CInt(Val(Notice.Split("|"c)(2)))
-        If LocalVersion < ServerVersion Then
-            Logger.Info($"需要下载最新正式版：{LocalVersion} -> {ServerVersion}")
-            If ServerConfig Is Nothing Then ServerLoader.WaitForExit(IsForceRestart:=ServerLoader.State = LoadState.Finished)
-            If ServerConfig Is Nothing Then Throw New Exception("无法从服务器获取正式版 PCL 下载链接！")
-            Dim Urls = CType(ServerConfig("Update")("Release")("DownloadUrls"), JArray).Select(Function(t) t.ToString).ToList()
-            NetDownloadByLoader(Urls, PathTemp & "Latest.zip", LoaderToSyncProgress, New FileChecker With {.MinSize = 1024 * 1024})
-            FileUtils.ExtractToDirectory(PathTemp & "Latest.zip", PathTemp)
-            FileUtils.Delete(PathTemp & "Latest.zip")
-            FileUtils.Move(PathTemp & "Plain Craft Launcher 2.exe", PathTemp & "Latest.exe")
-            Settings.Set("SystemHighestSavedBetaVersionReg", ServerVersion)
-        End If
-    End Sub
-
-#End Region
-
 #Region "联网配置"
 
     ''' <summary>
@@ -586,15 +336,6 @@ Friend Module ModSecret
         {.ReloadTimeout = 1000 * 60 * 60} '超时 1 小时
 
     Private Sub ServerSub(Loader As LoaderTask(Of Integer, Integer))
-        Try
-            If FileUtils.Exists(Paths.Base & "PCL\update.exe") Then
-                FileUtils.Delete(Paths.Base & "PCL\update.exe")
-                Logger.Info("已清理更新缓存")
-            End If
-        Catch ex As Exception
-            Logger.Warn(ex, "清理更新缓存失败", LogBehavior.ToastIfDebug)
-        End Try
-
         Dim LocalConfigVersion = 0
         Dim ConfigPath = PathTemp & "Cache\ServerConfig.json"
         Try
@@ -626,15 +367,6 @@ Friend Module ModSecret
                 Logger.Info($"本地公告编号：{LocalNoticeId}，服务器公告：{NoticeRaw}，需更新")
             Else
                 Logger.Info($"本地公告编号：{LocalNoticeId}，服务器公告：{NoticeRaw}，无需更新")
-                If Settings.Get(Of Integer)("SystemHighestSavedBetaVersionReg") < VersionCode OrElse Not FileUtils.Exists(PathTemp & "Latest.exe") Then
-                    Settings.Set("SystemHighestSavedBetaVersionReg", VersionCode)
-                    Logger.Info($"复制自身为最新正式版：版本号升高到 {VersionCode}")
-                    Try
-                        FileUtils.Copy(PathExe, PathTemp & "Latest.exe")
-                    Catch ex As Exception
-                        Logger.Warn(ex, "复制自身为最新正式版失败", LogBehavior.ToastIfDebug)
-                    End Try
-                End If
             End If
             FileUtils.Write(NoticePath, NoticeRaw)
         Catch ex As Exception
@@ -696,6 +428,9 @@ Friend Module ModSecret
             For Each Notice As JObject In CType(NoticeJson.Replace("{UNIQUE}", Identify).DeserializeJson(), JArray)
                 Dim NoticeId = If(Notice("id") Is Nothing, 0, CInt(Val(Notice("id"))))
                 If NoticeId <= LocalNoticeId Then Continue For
+                '忽略更新公告及旧缓存中的更新动作，避免附带的弹窗、退出或设置动作继续执行。
+                If If(Notice("isUpdate") Is Nothing, False, Notice("isUpdate").ToObject(Of Boolean)()) OrElse
+                   Notice.Descendants().OfType(Of JProperty)().Any(Function(p) {"update", "slientupdate", "silentupdate"}.Contains(p.Name.ToLowerInvariant())) Then Continue For
                 Dim IsMatched = True
                 Dim Requirements = TryCast(Notice("requirements"), JObject)
                 If Requirements IsNot Nothing Then
@@ -706,10 +441,8 @@ Friend Module ModSecret
                 If Not IsMatched Then Continue For
 
                 Dim ImportantLevel = If(Notice("importantLevel") Is Nothing, 2, CInt(Notice("importantLevel")))
-                Dim IsUpdateNotice = If(Notice("isUpdate") Is Nothing, False, Notice("isUpdate").ToObject(Of Boolean))
-                Logger.Info($"重要等级 {ImportantLevel}，更新公告 {IsUpdateNotice}")
-                If Settings.Get(Of Integer)(If(IsUpdateNotice, "SystemSystemUpdate", "SystemSystemActivity")) > ImportantLevel OrElse
-                   (IsUpdateNotice AndAlso IsUpdating) Then Continue For
+                Logger.Info($"重要等级 {ImportantLevel}")
+                If Settings.Get(Of Integer)("SystemSystemActivity") > ImportantLevel Then Continue For
 
                 Dim Title = If(Notice("title") Is Nothing, "公告", Notice("title").ToString)
                 Dim Description = If(Notice("description") Is Nothing, "", Notice("description").ToString).Replace("\n", vbCrLf)
@@ -758,13 +491,6 @@ Friend Module ModSecret
                                 For Each SettingEntry As KeyValuePair(Of String, JToken) In CType(ActionEntry.Value, JObject)
                                     Settings.Set(SettingEntry.Key, SettingEntry.Value.ToString)
                                 Next
-                            Case "update", "slientupdate"
-                                Dim SilentUpdate = ActionEntry.Name = "slientupdate"
-                                If Not HasUpdatePermission Then
-                                    If Not SilentUpdate Then InputPotatoCode(IsUpdating:=True)
-                                    If Not HasUpdatePermission Then Continue For
-                                End If
-                                UpdateStart(SilentUpdate)
                             Case Else
                                 Throw New Exception("未知的行动支：" & ActionEntry.Name & ", " & ActionEntry.Value.ToString)
                         End Select
@@ -836,11 +562,6 @@ Friend Module ModSecret
             Return DonationRank.None
         End Get
     End Property
-    Private ReadOnly Property HasUpdatePermission As Boolean
-        Get
-            Return True
-        End Get
-    End Property
 
     Private _PotatoFeatures As List(Of String) = Nothing
     Private Const EcdsaPublicKey As String = "RUNTMSAAAAC4QTUNAewh23Q4Q6koHkyIrDIIZUSbua23sf2DiZmIRwSzadISDRyTVTbuWniH3KR7rKj8XBsabms1be6i3c+S"
@@ -888,7 +609,7 @@ Friend Module ModSecret
         End Try
     End Function
 
-    Public Sub InputPotatoCode(IsUpdating As Boolean)
+    Public Sub InputPotatoCode()
         Hint("请使用 PCL 快照版输入土豆码！如果你赞助过 PCL，可以在爱发电私信发送【下载】获取 PCL 快照版！")
     End Sub
     Friend Sub GeneratePotatoCode()
